@@ -1,0 +1,145 @@
+name: Build upstream Telegram-iOS (unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Telegram-iOS git ref to build"
+        required: false
+        default: "release-13.2"
+        type: string
+      runner_label:
+        description: "Runner label (xcode-27 has Xcode 27.1/macOS 27)"
+        required: false
+        default: "xcode-27"
+        type: string
+      override_xcode_version:
+        description: "Pass --overrideXcodeVersion (fallback runners only)"
+        required: false
+        default: false
+        type: boolean
+      override_bazel_version:
+        description: "Pass --overrideBazelVersion (fallback runners only)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 360
+    steps:
+      - name: Checkout upstream Telegram-iOS
+        uses: actions/checkout@v4
+        with:
+          repository: TelegramMessenger/Telegram-iOS
+          ref: ${{ inputs.upstream_ref }}
+          path: telegram-ios
+          submodules: recursive
+          fetch-depth: 0
+          lfs: true
+
+      - name: Select required Xcode and install Metal toolchain if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/telegram-ios"
+          XCODE_VERSION="$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')"
+          XCODE_PATH="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          if [ ! -d "$XCODE_PATH" ]; then
+            XCODE_PATH="$(xcode-select -p)"
+          fi
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+          xcodebuild -downloadComponent MetalToolchain 2>/dev/null || true
+
+      - name: Create canonical source directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /Users/Shared
+          rm -rf /Users/Shared/telegram-ios
+          cp -R "$GITHUB_WORKSPACE/telegram-ios" /Users/Shared/telegram-ios
+          test -f /Users/Shared/telegram-ios/versions.json
+
+      - name: Prepare non-official build configuration
+        shell: bash
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          set -euo pipefail
+          cd /Users/Shared/telegram-ios
+          python3 - <<'PY'
+          import json
+          import os
+          import secrets as pysecrets
+
+          path = "build-system/appstore-configuration.json"
+          with open(path, encoding="utf-8") as f:
+              cfg = json.load(f)
+
+          api_id = (os.environ.get("TELEGRAM_API_ID") or "").strip()
+          api_hash = (os.environ.get("TELEGRAM_API_HASH") or "").strip()
+          if api_id and api_hash and api_id != "8":
+              cfg["api_id"] = api_id
+              cfg["api_hash"] = api_hash
+              print("Using repository API credentials from secrets")
+          else:
+              cfg["api_id"] = str(pysecrets.randbelow(900000) + 100000)
+              cfg["api_hash"] = pysecrets.token_hex(16)
+              print("Using generated build-only API credentials (not api_id 8)")
+
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(cfg, f, indent=2)
+              f.write("\n")
+          PY
+
+      - name: Build fake-signed IPA
+        shell: bash
+        env:
+          OVERRIDE_XCODE: ${{ inputs.override_xcode_version }}
+          OVERRIDE_BAZEL: ${{ inputs.override_bazel_version }}
+        run: |
+          set -euo pipefail
+          SOURCE_DIR=/Users/Shared/telegram-ios
+          BAZEL_USER_ROOT=/private/var/tmp/_bazel_telegram_ios_build
+          cd "$SOURCE_DIR"
+
+          EXTRA_ARGS=()
+          if [ "$OVERRIDE_XCODE" = "true" ]; then EXTRA_ARGS+=(--overrideXcodeVersion); fi
+          if [ "$OVERRIDE_BAZEL" = "true" ]; then EXTRA_ARGS+=(--overrideBazelVersion); fi
+
+          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
+          COMMIT_COUNT="$(git rev-list --count HEAD)"
+          BUILD_NUMBER=$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))
+          APP_VERSION="$(python3 -c 'import json; print(json.load(open("versions.json"))["app"])')"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+
+          python3 build-system/Make/ImportCertificates.py \
+            --path build-system/fake-codesigning/certs
+
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            "${EXTRA_ARGS[@]}" \
+            build \
+            --configurationPath=build-system/appstore-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER" \
+            --outputBuildArtifactsPath=build/artifacts
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-ios-unsigned-${{ env.BUILD_NUMBER }}
+          path: |
+            /Users/Shared/telegram-ios/build/artifacts/Telegram.ipa
+            /Users/Shared/telegram-ios/build/artifacts/Telegram.DSYMs.zip
+          if-no-files-found: warn
+          retention-days: 7
