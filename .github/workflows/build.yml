@@ -43,6 +43,28 @@ jobs:
           fetch-depth: 0
           lfs: true
 
+      - name: Allow expired upstream fake provisioning profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/telegram-ios"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("build-system/bazel-rules/rules_apple/tools/plisttool/plisttool.py")
+          text = path.read_text(encoding="utf-8")
+          old = """    expire = self._profile_metadata.get('ExpirationDate')
+              if expire and expire < datetime.datetime.now():
+          """
+          new = """    expire = None
+              if False and expire and expire < datetime.datetime.now():
+          """
+          if old not in text:
+              raise SystemExit("plisttool expiry check patch target not found")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          print("Patched rules_apple plisttool to ignore expired fake profiles")
+          PY
+
       - name: Select required Xcode and install Metal toolchain if needed
         shell: bash
         run: |
