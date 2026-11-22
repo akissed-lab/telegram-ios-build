@@ -16,3 +16,7 @@ The workflow overwrites `api_id`/`api_hash` in the generated config with reposit
 `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` when present, otherwise with random build-only values. It
 never uses upstream's public `api_id` `8`. If secrets are added to this repository, remember that
 the uploaded IPA embeds them.
+
+Upstream's fake provisioning profiles expired on 2026-10-30. The workflow patches the vendored
+`rules_apple` `plisttool.py` to skip the profile-expiration check. This only affects this private
+build sandbox and does not alter the checked-in upstream source in any repository.
